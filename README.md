@@ -1,4 +1,4 @@
-# Study Buddy — Frontend (session 5)
+# Study Buddy — Frontend
 
 Interface React/Vite pour le chatbot Study Buddy : streaming des réponses, sélecteur de modèle, notes personnelles, Stop / retry, affichage des tokens.
 
