@@ -1,10 +1,11 @@
 import { useEffect, useRef, type FormEvent, type KeyboardEvent } from 'react'
 import Markdown from 'react-markdown'
-import type { Role } from '../api'
+import type { Role, TokenUsage } from '../api'
 
 export interface ChatMessage {
   role: Role
   content: string
+  usage?: TokenUsage
 }
 
 interface ChatWindowProps {
@@ -13,12 +14,42 @@ interface ChatWindowProps {
   draft: string
   onDraftChange: (value: string) => void
   onSend: () => void
+  onStop: () => void
+  onRetry: (() => void) | null
+  noteMode: boolean
+  onNoteModeChange: (value: boolean) => void
+  models: string[]
+  selectedModel: string
+  onModelChange: (model: string) => void
 }
 
-export default function ChatWindow({ messages, loading, draft, onDraftChange, onSend }: ChatWindowProps) {
+function formatUsage(usage: TokenUsage): string {
+  const total = usage.total_tokens
+  if (typeof total === 'number') return `${total} tokens`
+  const parts: string[] = []
+  if (typeof usage.prompt_tokens === 'number') parts.push(`${usage.prompt_tokens} prompt`)
+  if (typeof usage.completion_tokens === 'number') {
+    parts.push(`${usage.completion_tokens} completion`)
+  }
+  return parts.length ? parts.join(' · ') : 'tokens'
+}
+
+export default function ChatWindow({
+  messages,
+  loading,
+  draft,
+  onDraftChange,
+  onSend,
+  onStop,
+  onRetry,
+  noteMode,
+  onNoteModeChange,
+  models,
+  selectedModel,
+  onModelChange,
+}: ChatWindowProps) {
   const bottomRef = useRef<HTMLDivElement>(null)
 
-  // Keep the latest message in view.
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, loading])
@@ -29,44 +60,109 @@ export default function ChatWindow({ messages, loading, draft, onDraftChange, on
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    // Enter sends, Shift+Enter inserts a new line.
     if (event.key === 'Enter' && !event.shiftKey) handleSubmit(event)
   }
 
   return (
     <section className="chat">
+      <div className="chat-toolbar">
+        <label className="model-picker">
+          <span>Modèle</span>
+          <select
+            value={selectedModel}
+            onChange={(e) => onModelChange(e.target.value)}
+            disabled={loading || models.length === 0}
+          >
+            {models.map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+
       <div className="messages">
         {messages.length === 0 && !loading && (
           <p className="muted center">Pose ta première question à Study Buddy.</p>
         )}
-        {messages.map((m, i) =>
-          m.role === 'system-notification' ? (
-            <div key={i} className="notification">
-              {m.content}
+        {messages.map((m, i) => {
+          if (m.role === 'system-notification') {
+            return (
+              <div key={i} className="notification">
+                {m.content}
+              </div>
+            )
+          }
+          if (m.role === 'note') {
+            return (
+              <div key={i} className="note">
+                <span className="note-label">Note personnelle</span>
+                <div className="note-body">{m.content}</div>
+              </div>
+            )
+          }
+          return (
+            <div key={i} className={`bubble-wrap ${m.role}`}>
+              <div className={`bubble ${m.role}`}>
+                {m.role === 'assistant' ? <Markdown>{m.content}</Markdown> : m.content}
+              </div>
+              {m.role === 'assistant' && m.usage && (
+                <div className="token-usage">{formatUsage(m.usage)}</div>
+              )}
             </div>
-          ) : (
-            <div key={i} className={`bubble ${m.role}`}>
-              {/* The LLM answers in Markdown; user messages are shown as typed. */}
-              {m.role === 'assistant' ? <Markdown>{m.content}</Markdown> : m.content}
-            </div>
-          ),
+          )
+        })}
+        {loading && messages[messages.length - 1]?.role !== 'assistant' && (
+          <div className="bubble assistant typing">…</div>
         )}
-        {loading && <div className="bubble assistant typing">…</div>}
         <div ref={bottomRef} />
       </div>
+
+      {onRetry && (
+        <div className="retry-bar">
+          <span>La dernière requête a échoué.</span>
+          <button type="button" onClick={onRetry}>
+            Réessayer
+          </button>
+        </div>
+      )}
+
       <form className="composer" onSubmit={handleSubmit}>
-        <textarea
-          value={draft}
-          onChange={(e) => onDraftChange(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="Écris ton message…"
-          rows={2}
-          disabled={loading}
-          autoFocus
-        />
-        <button type="submit" disabled={loading || !draft.trim()}>
-          Envoyer
-        </button>
+        <div className="composer-tools">
+          <label className="note-toggle">
+            <input
+              type="checkbox"
+              checked={noteMode}
+              onChange={(e) => onNoteModeChange(e.target.checked)}
+              disabled={loading}
+            />
+            Mode note
+          </label>
+          {noteMode && (
+            <span className="muted note-hint">Enregistrée dans le chat, jamais envoyée au LLM.</span>
+          )}
+        </div>
+        <div className="composer-row">
+          <textarea
+            value={draft}
+            onChange={(e) => onDraftChange(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder={noteMode ? 'Écris une note personnelle…' : 'Écris ton message…'}
+            rows={2}
+            disabled={loading && !noteMode}
+            autoFocus
+          />
+          {loading && !noteMode ? (
+            <button type="button" className="stop-button" onClick={onStop}>
+              Stop
+            </button>
+          ) : (
+            <button type="submit" disabled={loading || !draft.trim()}>
+              {noteMode ? 'Ajouter' : 'Envoyer'}
+            </button>
+          )}
+        </div>
       </form>
     </section>
   )

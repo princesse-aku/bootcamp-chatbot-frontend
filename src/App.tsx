@@ -1,11 +1,14 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import './App.css'
 import {
+  addNote,
   createConversation,
   getMessages,
   listConversations,
-  sendMessage,
+  listModels,
+  streamChat,
   type ConversationSummary,
+  type TokenUsage,
 } from './api'
 import ChatWindow, { type ChatMessage } from './components/ChatWindow'
 import Sidebar from './components/Sidebar'
@@ -21,9 +24,20 @@ export default function App() {
   const [draft, setDraft] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [models, setModels] = useState<string[]>([])
+  const [selectedModel, setSelectedModel] = useState('')
+  const [noteMode, setNoteMode] = useState(false)
+  const [retryPayload, setRetryPayload] = useState<{ text: string; model: string } | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
 
-  // On startup, load the history and open the most recent conversation.
   useEffect(() => {
+    listModels()
+      .then(({ models: list, default: def }) => {
+        setModels(list)
+        setSelectedModel(def)
+      })
+      .catch((err) => setError(errorMessage(err)))
+
     listConversations()
       .then((list) => {
         setConversations(list)
@@ -32,13 +46,14 @@ export default function App() {
       .catch((err) => setError(errorMessage(err)))
   }, [])
 
-  // Load the messages whenever another conversation is opened.
   useEffect(() => {
     if (activeId === null) return
     let cancelled = false
     getMessages(activeId)
       .then((list) => {
-        if (!cancelled) setMessages(list.map(({ role, content }) => ({ role, content })))
+        if (!cancelled) {
+          setMessages(list.map(({ role, content }) => ({ role, content })))
+        }
       })
       .catch((err) => !cancelled && setError(errorMessage(err)))
     return () => {
@@ -49,6 +64,7 @@ export default function App() {
   function selectConversation(id: number) {
     if (loading || id === activeId) return
     setError(null)
+    setRetryPayload(null)
     setDraft('')
     setMessages([])
     setActiveId(id)
@@ -57,6 +73,7 @@ export default function App() {
   async function handleNew() {
     if (loading) return
     setError(null)
+    setRetryPayload(null)
     try {
       const id = await createConversation()
       setConversations((list) => [
@@ -71,31 +88,114 @@ export default function App() {
     }
   }
 
+  function handleStop() {
+    abortRef.current?.abort()
+  }
+
+  async function sendChat(text: string, model: string) {
+    if (activeId === null) return
+    const isFirstMessage = messages.length === 0
+    setError(null)
+    setRetryPayload(null)
+    setDraft('')
+    setMessages((list) => [...list, { role: 'user', content: text }, { role: 'assistant', content: '' }])
+    setLoading(true)
+
+    const controller = new AbortController()
+    abortRef.current = controller
+    let usage: TokenUsage | undefined
+    let notification: string | undefined
+    let gotDelta = false
+
+    try {
+      await streamChat(activeId, text, model, {
+        signal: controller.signal,
+        onDelta: (chunk) => {
+          gotDelta = true
+          setMessages((list) => {
+            const next = [...list]
+            const last = next[next.length - 1]
+            if (last?.role === 'assistant') {
+              next[next.length - 1] = { ...last, content: last.content + chunk }
+            }
+            return next
+          })
+        },
+        onMeta: (meta) => {
+          if (meta.usage) usage = meta.usage
+          if (meta.notification) notification = meta.notification
+        },
+      })
+
+      setMessages((list) => {
+        const next = [...list]
+        const last = next[next.length - 1]
+        if (last?.role === 'assistant') {
+          next[next.length - 1] = { ...last, usage }
+        }
+        if (notification) {
+          next.push({ role: 'system-notification', content: notification })
+        }
+        return next
+      })
+      if (isFirstMessage) setConversations(await listConversations())
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        // Stop: drop the optimistic user + empty/partial assistant; nothing was saved.
+        setMessages((list) => {
+          const withoutAssistant = list[list.length - 1]?.role === 'assistant' ? list.slice(0, -1) : list
+          return withoutAssistant[withoutAssistant.length - 1]?.role === 'user'
+            ? withoutAssistant.slice(0, -1)
+            : withoutAssistant
+        })
+        setDraft(text)
+        setError('Génération arrêtée. Aucun message de ce tour n’a été enregistré.')
+      } else {
+        setMessages((list) => {
+          let next = list
+          if (next[next.length - 1]?.role === 'assistant') next = next.slice(0, -1)
+          if (next[next.length - 1]?.role === 'user') next = next.slice(0, -1)
+          return next
+        })
+        setDraft(text)
+        setRetryPayload({ text, model })
+        setError(errorMessage(err) + (gotDelta ? ' (réponse partielle non enregistrée)' : ''))
+      }
+    } finally {
+      abortRef.current = null
+      setLoading(false)
+    }
+  }
+
   async function handleSend() {
     if (activeId === null) return
     const text = draft.trim()
-    const isFirstMessage = messages.length === 0
-    setError(null)
-    setDraft('')
-    setMessages((list) => [...list, { role: 'user', content: text }])
-    setLoading(true)
-    try {
-      const { reply, notification } = await sendMessage(activeId, text)
-      setMessages((list) => [
-        ...list,
-        { role: 'assistant', content: reply },
-        ...(notification ? [{ role: 'system-notification' as const, content: notification }] : []),
-      ])
-      // The first message becomes the conversation's preview in the sidebar.
-      if (isFirstMessage) setConversations(await listConversations())
-    } catch (err) {
-      // The backend didn't save the turn: drop the optimistic message and give the text back.
-      setMessages((list) => list.slice(0, -1))
-      setDraft(text)
-      setError(errorMessage(err))
-    } finally {
-      setLoading(false)
+    if (!text) return
+
+    if (noteMode) {
+      setError(null)
+      setRetryPayload(null)
+      setDraft('')
+      try {
+        const note = await addNote(activeId, text)
+        setMessages((list) => [...list, { role: note.role, content: note.content }])
+      } catch (err) {
+        setDraft(text)
+        setError(errorMessage(err))
+      }
+      return
     }
+
+    if (!selectedModel) {
+      setError('Aucun modèle sélectionné.')
+      return
+    }
+    await sendChat(text, selectedModel)
+  }
+
+  function handleRetry() {
+    if (!retryPayload) return
+    void sendChat(retryPayload.text, retryPayload.model)
   }
 
   return (
@@ -128,7 +228,14 @@ export default function App() {
             loading={loading}
             draft={draft}
             onDraftChange={setDraft}
-            onSend={handleSend}
+            onSend={() => void handleSend()}
+            onStop={handleStop}
+            onRetry={retryPayload ? handleRetry : null}
+            noteMode={noteMode}
+            onNoteModeChange={setNoteMode}
+            models={models}
+            selectedModel={selectedModel}
+            onModelChange={setSelectedModel}
           />
         )}
       </main>

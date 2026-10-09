@@ -1,6 +1,8 @@
 // Thin typed wrappers around the FastAPI backend (proxied under /api by Vite).
 
-export type Role = 'user' | 'assistant' | 'system-notification'
+const API_BASE = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, '') ?? '/api'
+
+export type Role = 'user' | 'assistant' | 'system-notification' | 'note'
 
 export interface ConversationSummary {
   id: number
@@ -15,10 +17,32 @@ export interface Message {
   created_at: string
 }
 
+export interface ModelsResponse {
+  models: string[]
+  default: string
+}
+
+export interface TokenUsage {
+  prompt_tokens?: number
+  completion_tokens?: number
+  total_tokens?: number
+}
+
+export interface StreamMeta {
+  notification?: string
+  usage?: TokenUsage
+}
+
+export interface StreamChatHandlers {
+  onDelta: (text: string) => void
+  onMeta?: (meta: StreamMeta) => void
+  signal?: AbortSignal
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response
   try {
-    response = await fetch(`/api${path}`, {
+    response = await fetch(`${API_BASE}${path}`, {
       ...init,
       headers: { 'Content-Type': 'application/json', ...init?.headers },
     })
@@ -26,12 +50,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error('Impossible de joindre le serveur.')
   }
   if (!response.ok) {
-    // FastAPI errors look like {"detail": "..."}.
     const body = await response.json().catch(() => null)
     const detail = typeof body?.detail === 'string' ? body.detail : null
     throw new Error(detail ?? `Erreur ${response.status}`)
   }
   return response.json() as Promise<T>
+}
+
+export function listModels(): Promise<ModelsResponse> {
+  return request('/models')
 }
 
 export function listConversations(): Promise<ConversationSummary[]> {
@@ -49,14 +76,112 @@ export function getMessages(conversationId: number): Promise<Message[]> {
   return request(`/conversations/${conversationId}/messages`)
 }
 
-export interface ChatResult {
-  reply: string
-  notification: string | null // set when the backend also stored a system-notification
+export async function addNote(conversationId: number, content: string): Promise<Message> {
+  return request(`/conversations/${conversationId}/notes`, {
+    method: 'POST',
+    body: JSON.stringify({ content }),
+  })
 }
 
-export function sendMessage(conversationId: number, message: string): Promise<ChatResult> {
-  return request('/chat', {
-    method: 'POST',
-    body: JSON.stringify({ conversation_id: conversationId, message }),
-  })
+export async function streamChat(
+  conversationId: number,
+  message: string,
+  model: string,
+  handlers: StreamChatHandlers,
+): Promise<void> {
+  let response: Response
+  try {
+    response = await fetch(`${API_BASE}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversation_id: conversationId, message, model }),
+      signal: handlers.signal,
+    })
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw err
+    }
+    throw new Error('Impossible de joindre le serveur.')
+  }
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => null)
+    const detail = typeof body?.detail === 'string' ? body.detail : null
+    throw new Error(detail ?? `Erreur ${response.status}`)
+  }
+  if (!response.body) {
+    throw new Error('Réponse stream vide.')
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let sawDone = false
+  let streamError: string | null = null
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+
+    // SSE events are separated by a blank line.
+    let sep: number
+    while ((sep = buffer.indexOf('\n\n')) !== -1) {
+      const rawEvent = buffer.slice(0, sep)
+      buffer = buffer.slice(sep + 2)
+
+      let eventName = 'message'
+      const dataLines: string[] = []
+      for (const line of rawEvent.split('\n')) {
+        if (line.startsWith('event:')) {
+          eventName = line.slice(6).trim()
+        } else if (line.startsWith('data:')) {
+          dataLines.push(line.slice(5).trim())
+        }
+      }
+      const data = dataLines.join('\n')
+      if (!data) continue
+
+      if (eventName === 'error') {
+        try {
+          const parsed = JSON.parse(data) as { detail?: string }
+          streamError = parsed.detail ?? 'Erreur pendant le streaming.'
+        } catch {
+          streamError = 'Erreur pendant le streaming.'
+        }
+        continue
+      }
+
+      if (eventName === 'meta') {
+        try {
+          handlers.onMeta?.(JSON.parse(data) as StreamMeta)
+        } catch {
+          /* ignore malformed meta */
+        }
+        continue
+      }
+
+      if (data === '[DONE]') {
+        sawDone = true
+        continue
+      }
+
+      try {
+        const payload = JSON.parse(data) as {
+          choices?: Array<{ delta?: { content?: string } }>
+        }
+        const content = payload.choices?.[0]?.delta?.content
+        if (content) handlers.onDelta(content)
+      } catch {
+        /* ignore non-JSON keepalive lines */
+      }
+    }
+  }
+
+  if (streamError) {
+    throw new Error(streamError)
+  }
+  if (!sawDone) {
+    throw new Error('Le flux a été interrompu avant la fin.')
+  }
 }
